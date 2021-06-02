@@ -1,0 +1,3 @@
+[submodule "stillwater"]
+	path = stillwater
+	url = git@github.com:alecgunny/stillwater.git

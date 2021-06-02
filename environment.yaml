@@ -1,4 +1,6 @@
 name: deepclean-online
+channels:
+  - conda-forge
 dependencies:
   - python=3.8
   - gwpy
@@ -7,7 +9,7 @@ dependencies:
   - tblib
   - ldas-tools-framecpp
   - pip
-  pip:
+  - pip:
       - git+https://github.com/alecgunny/stillwater.git@multistream
       - git+https://github.com/alecgunny/typeo.git@main
       - --extra-index-url "https://pypi.ngc.nvidia.com"
