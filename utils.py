@@ -1,5 +1,3 @@
-import contextlib
-import io
 import os
 import pickle
 import queue
@@ -7,14 +5,16 @@ import re
 import typing
 import time
 import multiprocessing as mp
+from contextlib import redirect_stderr
+from io import StringIO
 
 import numpy as np
-from gwpy.timeseries import TimeSeriesDict
+from gwpy.timeseries import TimeSeries, TimeSeriesDict
 from stillwater import ExceptionWrapper, StreamingInferenceProcess, Package
 from wurlitzer import sys_pipes
 
 
-def _get_file_gps_timestamp(fname):
+def _get_file_timestamp(fname):
     # subtract one from file creation time to
     # account for the latency incurred by waiting
     # for the file to be created
@@ -79,14 +79,14 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
             path = self.input_pattern.format(self._t0)
             while time.time() - start_time < 3:
                 try:
-                    with contextlib.redirect_stderr(io.StringIO()), sys_pipes():
+                    with redirect_stderr(StringIO()), sys_pipes():
                         data = TimeSeriesDict.read(path, self.channels)
                     break
                 except FileNotFoundError:
                     time.sleep(1e-3)
             else:
                 raise ValueError(f"Couldn't find next timestep file {path}")
-            self._latency_t0 = _get_file_gps_timestamp(path)
+            self._latency_t0 = _get_file_timestamp(path)
 
             # resample the data and turn it into a numpy array
             data.resample(self.sample_rate)
@@ -94,7 +94,10 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
                 [data[channel].value for channel in self.channels]
             ).astype("float32")
 
-            self._children.writer.send((path, data[0], self._latency_t0))
+            if self._data is not None:
+                self._children.writer.send((path, data[0], self._latency_t0))
+            elif self._data is None:
+                self._children.writer.send((None, None, None))
             data = data[1:]
 
             if self._data is not None and start < self._data.shape[1]:
@@ -156,19 +159,39 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         super().__init__(name=name)
 
     def _get_data(self):
-        if self.parents["reader"].poll():
-            stuff = self.parents["reader"].recv()
+        if self._parents.reader.poll():
+            stuff = self._parents.reader.recv()
             self._strains.append(stuff)
 
-        if self.parents["client"].poll():
-            return self.parents["client"].recv()
+        if self._parents.reader.poll():
+            return self._parents.client.recv()
         return None
 
     def _do_stuff_with_data(self, package):
-        self._noise = self._noise.append(package.x[0, :kernel_stride])
+        self._noise = self._noise.append(package.x)
 
         if len(self._noise) >= self.sample_rate:
             noise, self._noise = np.split(self._noise, self.sample_rate)
-            fname, strain, t0 = self._strains.pop(0)
+            fname, strain, latency_t0 = self._strains.pop(0)
+            if fname is None:
+                return
 
-            strain = strain
+            _, fname = os.path.split(fname)
+            t0 = int(re.search("(?<=-)[0-9]{10}(?=-)", fname).group(0))
+
+            strain = strain - noise
+            timeseries = TimeSeries(strain, t0=t0, sample_rate=self.sample_rate)
+            x = TimeSeriesDict([self.channel_name], values=timeseries)
+
+            write_fname = fname.replace(".gwf", "_cleaned.gwf")
+            write_fname = os.path.join(self.output_dir, write_fname)
+            x.write(write_fname)
+
+            self.children.output.send((write_fname, time.time() - latency_t0))
+
+
+class DummyClient(StreamingInferenceProcess):
+    def _do_stuff_with_data(self, packages):
+        package = packages["reader"]
+        package.x = package.x.sum(axis=0)
+        self._children.writer.send(package)

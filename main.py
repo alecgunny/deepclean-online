@@ -5,7 +5,7 @@ import time
 import typeo
 from stillwater import ThreadedMultiStreamClient
 from stillwater.utils import ExceptionWrapper
-from utils import GwfFrameFileDataSource, GwfFrameFileWriter
+from utils import GwfFrameFileDataSource, GwfFrameFileWriter, DummyClient
 
 
 def main(
@@ -15,21 +15,27 @@ def main(
     input_pattern: str,
     channels: str,
     sample_rate: int,  # TODO: can get from model config,
-    output_pattern: str
+    output_dir: str
 ):
     with open(channels, "r") as f:
         channels = f.read().splitlines()
+        channels = [x.split()[0] for x in channels]
 
-    client = ThreadedMultiStreamClient(
-        url, model_name, model_version, name="client"
+    # client = ThreadedMultiStreamClient(
+    #     url, model_name, model_version, name="client"
+    # )
+    client = DummyClient()
+    writer = GwfFrameFileWriter(
+        output_dir channels[0], sample_rate, name="writer"
     )
-    writer = GwfFrameFileWriter(output_pattern, channels[0], name="writer")
 
     source = GwfFrameFileDataSource(
         input_pattern, channels, sample_rate, name="reader"
     )
     writer.add_parent(source)
-    client.add_source(source, child=writer)
+    # client.add_source(source, child=writer)
+    client.add_parent(source)
+    client.add_child(writer)
 
     conn_out = writer.add_child("output")
     client.start()
@@ -39,7 +45,7 @@ def main(
         while True:
             fname = None
             if conn_out.poll():
-                fname = conn_out.recv()
+                fname, latency = conn_out.recv()
             elif (time.time() - last_recv_time) > 3:
                 raise RuntimeError(
                     "No files written in last 3 seconds, exiting"
@@ -66,7 +72,7 @@ def main(
                 continue
 
             logging.info(
-                "Wrote cleaned data to {}, average latency {:0.2}f ms".format(
+                "Wrote cleaned data to {} with {:0.2f} ms of latency".format(
                     fname, latency * 1000
                 )
             )
@@ -74,3 +80,12 @@ def main(
 
 if __name__ == "__main__":
     parser = typeo.make_parser(main)
+    flags = parser.parse_args()
+
+    logging.basicConfig(
+        format="%(asctime)s.%(msecs)03d - %(levelname)-8s %(message)s",
+        stream=sys.stdout,
+        datefmt="%H:%M:%S",
+        level=logging.INFO
+    )
+    main(**vars(flags))
