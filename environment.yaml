@@ -5,12 +5,14 @@ dependencies:
   - python=3.8
   - gwpy
   - attrs
+  - requests
   - numpy
   - tblib
-  - ldas-tools-framecpp
+  - python-ldas-tools-framecpp
   - pip
   - pip:
-      - git+https://github.com/alecgunny/stillwater.git@multistream
+      - -e ./stillwater
       - git+https://github.com/alecgunny/typeo.git@main
       - --extra-index-url "https://pypi.ngc.nvidia.com"
       - tritonclient[all]
+      - wurlitzer
