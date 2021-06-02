@@ -35,7 +35,7 @@ def main(
     client.start()
     last_recv_time = time.time()
     # latency, n = 0.0, 0
-    try:
+    with client:
         while True:
             fname = None
             if conn_out.poll():
@@ -70,18 +70,6 @@ def main(
                     fname, latency * 1000
                 )
             )
-    except Exception:
-        logging.error("Fatal error:")
-    finally:
-        client.stop()
-        client.join(10)
-        try:
-            client.close()
-        except ValueError:
-            logging.warning("Client closing ungracefully")
-            client.terminate()
-            time.sleep(1)
-            client.close()
 
 
 if __name__ == "__main__":
