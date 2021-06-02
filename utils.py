@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import pickle
 import queue
@@ -8,7 +10,8 @@ import multiprocessing as mp
 
 import numpy as np
 from gwpy.timeseries import TimeSeriesDict
-from stillwater import StreamingInferenceProcess, Package
+from stillwater import ExceptionWrapper, StreamingInferenceProcess, Package
+from wurlitzer import sys_pipes
 
 
 def _get_file_gps_timestamp(fname):
@@ -73,10 +76,11 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
             # if it takes more than a second to get created,
             # then assume the worst and raise an error
             start_time = time.time()
-            path = self.path_pattern.format(self._t0)
+            path = self.input_pattern.format(self._t0)
             while time.time() - start_time < 3:
                 try:
-                    data = TimeSeriesDict.read(path, self.channels)
+                    with contextlib.redirect_stderr(io.StringIO()), sys_pipes():
+                        data = TimeSeriesDict.read(path, self.channels)
                     break
                 except FileNotFoundError:
                     time.sleep(1e-3)
@@ -90,7 +94,7 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
                 [data[channel].value for channel in self.channels]
             ).astype("float32")
 
-            self.children["writer"].send((path, data[0], self._latency_t0))
+            self._children.writer.send((path, data[0], self._latency_t0))
             data = data[1:]
 
             if self._data is not None and start < self._data.shape[1]:
@@ -110,14 +114,23 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         t0 = self._latency_t0 + self._idx * self.kernel_stride
         return Package(x=x, t0=t0)
 
+    def _break_glass(self, exception):
+        super()._break_glass(exception)
+        self._self_q.put(ExceptionWrapper(exception))
+
     def _do_stuff_with_data(self, package):
         self._self_q.put(package)
 
     def __next__(self):
         while True:
             try:
-                return self._self_q.get_nowait()
+                package = self._self_q.get_nowait()
+                if isinstance(package, ExceptionWrapper):
+                    package.reraise()
+                return package
             except queue.Empty:
+                if not self.is_alive():
+                    raise StopIteration
                 time.sleep(1e-6)
 
 
