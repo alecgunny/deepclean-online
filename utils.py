@@ -46,11 +46,12 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         return self
 
     def _get_initial_timestamp(self):
-        prefix, postfix = self.input_pattern.split("{}")
+        input_dir, input_pattern = os.path.split(self.input_pattern)
+        prefix, postfix = input_pattern.split("{}")
         regex = re.compile(
             "(?<={})[0-9]{}(?={})".format(prefix, "{10}", postfix)
         )
-        timestamps = map(regex.search, os.path.dirname(self.input_pattern))
+        timestamps = map(regex.search, os.listdir(input_dir))
         if not any(timestamps):
             raise ValueError(
                 "Couldn't find any timestamps matching the "
