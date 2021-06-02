@@ -1,0 +1,14 @@
+name: deepclean-online
+dependencies:
+  - python=3.8
+  - gwpy
+  - attrs
+  - numpy
+  - tblib
+  - ldas-tools-framecpp
+  - pip
+  pip:
+      - git+https://github.com/alecgunny/stillwater.git@multistream
+      - git+https://github.com/alecgunny/typeo.git@main
+      - --extra-index-url "https://pypi.ngc.nvidia.com"
+      - tritonclient[all]
