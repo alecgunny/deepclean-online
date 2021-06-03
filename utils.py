@@ -6,6 +6,7 @@ import typing
 import time
 import multiprocessing as mp
 from contextlib import redirect_stderr
+from functools import partial
 from io import StringIO
 
 import numpy as np
@@ -45,7 +46,8 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         super().__init__(name=name)
 
     def __iter__(self):
-        self.start()
+        if not self.is_alive():
+            raise ValueError("Must start reader before iterating")
         return self
 
     def _get_initial_timestamp(self):

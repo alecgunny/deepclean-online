@@ -43,13 +43,12 @@ def main(
         name="reader"
     )
     writer.add_parent(source)
-    # client = DummyClient(source, name="client")
     client.add_data_source(source, child=writer)
 
     conn_out = writer.add_child("output")
     last_recv_time = time.time()
     latency, n = 0.0, 0
-    with client, writer:
+    with source, client, writer:
         while True:
             fname = None
             if conn_out.poll():
