@@ -22,7 +22,7 @@ def main(
 ):
     with open(channels, "r") as f:
         channels = f.read().splitlines()
-        channels = [x.split()[0] for x in channels[:21]]
+        channels = [x.split()[0] for x in channels[:22]]
 
     client = StreamingInferenceClient(
         url, model_name, model_version, name="client"
@@ -68,9 +68,11 @@ def main(
             # update our running latency measurement
             for i in range(20):
                 try:
-                    _, t0, __, tf = client._metric_q.get_nowait()
+                    _, __, t0, tf = client._metric_q.get_nowait()
                 except queue.Empty:
                     break
+                except ValueError:
+                    continue
                 n += 1
                 latency += (tf - t0 - latency) / n
 

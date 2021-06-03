@@ -46,8 +46,6 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         super().__init__(name=name)
 
     def __iter__(self):
-        if not self.is_alive():
-            raise ValueError("Must start reader before iterating")
         return self
 
     def _get_initial_timestamp(self):
@@ -73,7 +71,7 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         start = self._idx * self._update_size
         stop = (self._idx + 1) * self._update_size
 
-        if self._data is None or stop > self._data.shape[1]:
+        if self._data is None or stop >= self._data.shape[1]:
             # try to load in the next second's worth of data
             # if it takes more than a second to get created,
             # then assume the worst and raise an error
@@ -177,7 +175,7 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
     def _do_stuff_with_data(self, package):
         # add the new inferences to the
         # running noise estimate array
-        self._noise = np.append(self._noise, package.x)
+        self._noise = np.append(self._noise, package["output_0"].x[0, -8:])
 
         if len(self._noise) >= self.sample_rate:
             # if we've accumulated a frame's worth of
