@@ -18,7 +18,7 @@ def _get_file_timestamp(fname):
     # subtract one from file creation time to
     # account for the latency incurred by waiting
     # for the file to be created
-    file_creation_timestamp = os.stat(fname).st_ctime - 1
+    file_creation_timestamp = os.stat(fname).st_ctime
     return file_creation_timestamp
 
 
@@ -89,6 +89,7 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
             self._latency_t0 = _get_file_timestamp(path)
 
             # resample the data and turn it into a numpy array
+            _preproc_start = time.time()
             data.resample(self.sample_rate)
             data = np.stack(
                 [data[channel].value for channel in self.channels]
@@ -96,7 +97,7 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
 
             if self._data is not None:
                 self._children.writer.send((path, data[0], self._latency_t0))
-            elif self._data is None:
+            else:
                 self._children.writer.send((None, None, None))
             data = data[1:]
 
@@ -156,40 +157,60 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         self._noise = np.array([])
         super().__init__(name=name)
 
-    def _get_data(self):
-        if self._parents.reader.poll():
-            stuff = self._parents.reader.recv()
-            self._strains.append(stuff)
-
-        if self._parents.client.poll():
-            package = self._parents.client.recv()
+    def _try_recv_and_check(self, conn):
+        if conn.poll():
+            package = conn.recv()
             if isinstance(package, ExceptionWrapper):
                 package.reraise()
             return package
-        return None
+
+    def _get_data(self):
+        stuff = self._try_recv_and_check(self._parents.reader)
+        if stuff is not None:
+            # check if we have a new strain
+            # from the reader process first
+            self._strains.append(stuff)
+        return self._try_recv_and_check(self._parents.client)
 
     def _do_stuff_with_data(self, package):
+        # add the new inferences to the
+        # running noise estimate array
         self._noise = np.append(self._noise, package.x)
+
         if len(self._noise) >= self.sample_rate:
+            # if we've accumulated a frame's worth of
+            # noise, split it off and subtract it from
+            # its corresponding strain
             noise, self._noise = np.split(self._noise, [self.sample_rate])
+
             fname, strain, latency_t0 = self._strains.pop(0)
             if fname is None:
+                # don't write the first frame's worth of data
+                # since those estimates will be bad from being
+                # streamed on top of the 0 initialized state
                 return
 
+            # get the frame timestamp from the filename
             _, fname = os.path.split(fname)
             t0 = int(re.search("(?<=-)[0-9]{10}(?=-)", fname).group(0))
 
-            strain = strain - noise
+            # subtract the noise estimate from the strain
+            # and create a gwpy timeseries from it
+            cleaned = strain - noise
             timeseries = TimeSeries(
-                strain, t0=t0, sample_rate=self.sample_rate, channel=self.channel_name
+                cleaned, t0=t0, sample_rate=self.sample_rate, channel=self.channel_name
             )
 
+            # add "_cleaned" to the filename and write the cleaned
+            # strain to this new file in the desired location
             write_fname = fname.replace(".gwf", "_cleaned.gwf")
             write_fname = os.path.join(self.output_dir, write_fname)
-            print(write_fname)
             timeseries.write(write_fname)
+            # np.save(write_fname, strain)
 
-            self.children.output.send((write_fname, time.time() - latency_t0))
+            # let the main process know that we wrote a file and
+            # what the corresponding latency to that write was
+            self._children.output.send((write_fname, time.time() - latency_t0))
 
 
 class DummyClient(StreamingInferenceProcess):
