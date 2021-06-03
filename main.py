@@ -3,7 +3,7 @@ import sys
 import time
 
 import typeo
-from stillwater import ThreadedMultiStreamClient
+from stillwater import StreamingInferenceClient
 from stillwater.utils import ExceptionWrapper
 from utils import GwfFrameFileDataSource, GwfFrameFileWriter, DummyClient
 
@@ -14,38 +14,45 @@ def main(
     model_version: int,
     input_pattern: str,
     channels: str,
+    kernel_stride: float,
     sample_rate: int,  # TODO: can get from model config,
     output_dir: str
 ):
     with open(channels, "r") as f:
         channels = f.read().splitlines()
-        channels = [x.split()[0] for x in channels]
+        channels = [x.split()[0] for x in channels[:21]]
 
     # client = ThreadedMultiStreamClient(
     #     url, model_name, model_version, name="client"
     # )
-    client = DummyClient()
     writer = GwfFrameFileWriter(
-        output_dir channels[0], sample_rate, name="writer"
+        output_dir,
+        channel_name=channels[0],
+        sample_rate=sample_rate,
+        name="writer"
     )
 
     source = GwfFrameFileDataSource(
-        input_pattern, channels, sample_rate, name="reader"
+        input_pattern,
+        channels=channels,
+        kernel_stride=kernel_stride,
+        sample_rate=sample_rate,
+        preproc_file="",
+        name="reader"
     )
     writer.add_parent(source)
+    client = DummyClient(source, name="client")
     # client.add_source(source, child=writer)
-    client.add_parent(source)
     client.add_child(writer)
 
     conn_out = writer.add_child("output")
-    client.start()
     last_recv_time = time.time()
     # latency, n = 0.0, 0
-    with client:
+    with client, writer:
         while True:
             fname = None
             if conn_out.poll():
-                fname, latency = conn_out.recv()
+                fname = conn_out.recv()
             elif (time.time() - last_recv_time) > 3:
                 raise RuntimeError(
                     "No files written in last 3 seconds, exiting"
@@ -54,6 +61,8 @@ def main(
             # make sure our pipeline didn't raise an error
             if isinstance(fname, ExceptionWrapper):
                 fname.reraise()
+            elif fname is not None:
+                fname, latency = fname
 
             # # update our running latency measurement
             # for i in range(20):
@@ -76,6 +85,7 @@ def main(
                     fname, latency * 1000
                 )
             )
+            break
 
 
 if __name__ == "__main__":

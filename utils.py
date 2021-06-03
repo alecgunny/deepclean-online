@@ -132,8 +132,8 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
                     package.reraise()
                 return package
             except queue.Empty:
-                if not self.is_alive():
-                    raise StopIteration
+                # if not self.is_alive():
+                #     raise StopIteration
                 time.sleep(1e-6)
 
 
@@ -143,7 +143,6 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         output_dir,
         channel_name,
         sample_rate,
-        kernel_stride,
         name=None
     ):
         if not os.path.exists(output_dir):
@@ -152,7 +151,6 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         self.output_dir = output_dir
         self.channel_name = channel_name
         self.sample_rate = sample_rate
-        self.kernel_stride = kernel_stride
 
         self._strains = []
         self._noise = np.array([])
@@ -163,15 +161,17 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
             stuff = self._parents.reader.recv()
             self._strains.append(stuff)
 
-        if self._parents.reader.poll():
-            return self._parents.client.recv()
+        if self._parents.client.poll():
+            package = self._parents.client.recv()
+            if isinstance(package, ExceptionWrapper):
+                package.reraise()
+            return package
         return None
 
     def _do_stuff_with_data(self, package):
-        self._noise = self._noise.append(package.x)
-
+        self._noise = np.append(self._noise, package.x)
         if len(self._noise) >= self.sample_rate:
-            noise, self._noise = np.split(self._noise, self.sample_rate)
+            noise, self._noise = np.split(self._noise, [self.sample_rate])
             fname, strain, latency_t0 = self._strains.pop(0)
             if fname is None:
                 return
@@ -180,18 +180,31 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
             t0 = int(re.search("(?<=-)[0-9]{10}(?=-)", fname).group(0))
 
             strain = strain - noise
-            timeseries = TimeSeries(strain, t0=t0, sample_rate=self.sample_rate)
-            x = TimeSeriesDict([self.channel_name], values=timeseries)
+            timeseries = TimeSeries(
+                strain, t0=t0, sample_rate=self.sample_rate, channel=self.channel_name
+            )
 
             write_fname = fname.replace(".gwf", "_cleaned.gwf")
             write_fname = os.path.join(self.output_dir, write_fname)
-            x.write(write_fname)
+            print(write_fname)
+            timeseries.write(write_fname)
 
             self.children.output.send((write_fname, time.time() - latency_t0))
 
 
 class DummyClient(StreamingInferenceProcess):
-    def _do_stuff_with_data(self, packages):
-        package = packages["reader"]
-        package.x = package.x.sum(axis=0)
+    def __init__(self, reader, name=None):
+        self.reader = iter(reader)
+        super().__init__(name=name)
+
+    def _get_data(self):
+        return next(self.reader)
+
+    def _do_stuff_with_data(self, package):
+        package.x = package.x.sum(axis=0) * 0.
         self._children.writer.send(package)
+
+    def __exit__(self, *exc_args):
+        super().__exit__(*exc_args)
+        self.reader.try_elegant_stop()
+
