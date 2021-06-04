@@ -3,18 +3,17 @@ import queue
 import sys
 import time
 
-import numpy as np
 import typeo
 from stillwater import StreamingInferenceClient
 from stillwater.utils import ExceptionWrapper
-from utils import GwfFrameFileDataSource, GwfFrameFileWriter, DummyClient
+from utils import GwfFrameFileDataSource, GwfFrameFileWriter
 
 
 def main(
     url: str,
     model_name: str,
     model_version: int,
-    input_pattern: str,
+    input_dir: str,
     channels: str,
     kernel_stride: float,
     sample_rate: int,  # TODO: can get from model config,
@@ -35,7 +34,7 @@ def main(
     )
 
     source = GwfFrameFileDataSource(
-        input_pattern,
+        input_dir,
         channels=channels,
         kernel_stride=kernel_stride,
         sample_rate=sample_rate,
