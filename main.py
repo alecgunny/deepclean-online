@@ -13,7 +13,7 @@ def main(
     url: str,
     model_name: str,
     model_version: int,
-    input_dir: str,
+    input_pattern: str,
     channels: str,
     kernel_stride: float,
     sample_rate: int,  # TODO: can get from model config,
@@ -35,7 +35,7 @@ def main(
     )
 
     source = GwfFrameFileDataSource(
-        input_dir,
+        input_pattern,
         channels=channels,
         kernel_stride=kernel_stride,
         sample_rate=sample_rate,

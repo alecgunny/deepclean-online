@@ -28,14 +28,14 @@ def _get_file_timestamp(fname):
 class GwfFrameFileDataSource(StreamingInferenceProcess):
     def __init__(
         self,
-        input_dir: str,
+        input_pattern: str,
         channels: typing.List[str],
         kernel_stride: float,
         sample_rate: float,
         preproc_file: str,
         name: typing.Optional[str] = None
     ):
-        self.input_dir = input_dir
+        self.input_pattern = input_pattern
         self.channels = channels
         self.kernel_stride = kernel_stride
         self.sample_rate = sample_rate
@@ -43,17 +43,17 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
 
         self._idx = None
         self._data = None
+        self._last_time = time.time()
         self._self_q = mp.Queue()
 
         super().__init__(name=name)
 
     def _get_initial_timestamp(self):
         # find all the gwf frames in the input dir
-        fs = glob.glob(os.path.join(self.input_dir, "*.gwf"))
+        input_dir = os.path.dirname(self.input_pattern)
+        fs = glob.glob(os.path.join(input_dir, "*.gwf"))
         if len(fs) == 0:
-            raise ValueError(
-                f"No gwf frames in input directory {self.input_dir}"
-            )
+            raise ValueError(f"No gwf frames in input directory {input_dir}")
 
         # assume any consecutive 10 integers in the
         # filename are the timestamp
@@ -62,7 +62,7 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         if not any(timestamps):
             raise ValueError(
                 "Couldn't find any valid timestamps in "
-                f"input directory {self.input_dir}"
+                f"input directory {input_dir}"
             )
 
         timestamps = [int(t.group(0)) for t in timestamps if t is not None]
@@ -135,7 +135,10 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         # offset the frame's initial time by the time
         # corresponding to the first sample of stream
         self._idx += 1
-        return Package(x=x, t0=time.time())
+        while (time.time() - self._last_time) < (self.kernel_stride / 2):
+            time.sleep(1e-6)
+        self._last_time = time.time()
+        return Package(x=x, t0=self._last_time)
 
     def _break_glass(self, exception):
         super()._break_glass(exception)
@@ -203,15 +206,15 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
             # its corresponding strain
             noise, self._noise = np.split(self._noise, [self.sample_rate])
 
-            fname, strain = self._strains.pop(0)
-            if fname is None:
+            frame_path, strain = self._strains.pop(0)
+            if frame_path is None:
                 # don't write the first frame's worth of data
                 # since those estimates will be bad from being
                 # streamed on top of the 0 initialized state
                 return
 
             # get the frame timestamp from the filename
-            _, fname = os.path.split(fname)
+            _, fname = os.path.split(frame_path)
             t0 = int(re.search("(?<=-)[0-9]{10}(?=-)", fname).group(0))
 
             # subtract the noise estimate from the strain
@@ -232,7 +235,7 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
 
             # let the main process know that we wrote a file and
             # what the corresponding latency to that write was
-            latency = time.time() - _get_file_timestamp(fname)
+            latency = time.time() - _get_file_timestamp(frame_path)
             self._children.output.send((write_fname, latency))
 
 
