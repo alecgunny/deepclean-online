@@ -10,6 +10,8 @@ from contextlib import redirect_stderr
 from io import StringIO
 
 import numpy as np
+import tritonclient.grpc as triton
+from google.protobuf import text_format
 from gwpy.timeseries import TimeSeries, TimeSeriesDict
 from stillwater import ExceptionWrapper, StreamingInferenceProcess, Package
 from wurlitzer import sys_pipes
@@ -249,3 +251,39 @@ class DummyClient(StreamingInferenceProcess):
     def __exit__(self, *exc_args):
         super().__exit__(*exc_args)
         self.reader.try_elegant_stop()
+
+
+class ModelController:
+    def __init__(self, url, model_repo):
+        self.client = triton.InferenceServerClient(url)
+        self.model_repo = model_repo
+
+    @property
+    def deepclean_config(self):
+        return os.path.join(self.model_repo, "deepclean", "config.pbtxt")
+
+    def scale(self, gpus, count):
+        model_config = triton.model_config_pb2.ModelConfig()
+        with open(self.deepclean_config, "r") as f:
+            text_format.Merge(f.read(), model_config)
+            model_config.MergeFromString(f.read())
+
+        try:
+            model_config.instance_group[0].gpus = gpus
+            model_config.instance_group[0].count = count
+        except IndexError:
+            instance_group = triton.model_config_pb2.ModelInstanceGroup(
+                count=count, gpus=gpus
+            )
+            model_config.instance_group.append(instance_group)
+
+        with open(self.deepclean_config, "w") as f:
+            f.write(str(model_config))
+
+    def load(self, kernel_stride):
+        model_name = f"dc-stream_kernel-stride={kernel_stride}"
+        self.client.load_model(model_name)
+
+    def unload(self, kernel_stride):
+        model_name = f"dc-stream_kernel-stride={kernel_stride}"
+        self.client.unload_model(model_name, unload_dependents=True)

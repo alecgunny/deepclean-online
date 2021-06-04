@@ -17,7 +17,8 @@ def main(
     channels: str,
     kernel_stride: float,
     sample_rate: int,  # TODO: can get from model config,
-    output_dir: str
+    output_dir: str,
+    fname: str
 ):
     with open(channels, "r") as f:
         channels = f.read().splitlines()
@@ -46,7 +47,7 @@ def main(
 
     conn_out = writer.add_child("output")
     last_recv_time = time.time()
-    latency, n = 0.0, 0
+    n = 0
     with source, client, writer:
         while True:
             fname = None
@@ -64,17 +65,6 @@ def main(
             elif fname is not None:
                 fname, e2e_latency = fname
 
-            # update our running latency measurement
-            for i in range(20):
-                try:
-                    _, __, t0, tf = client._metric_q.get_nowait()
-                except queue.Empty:
-                    break
-                except ValueError:
-                    continue
-                n += 1
-                latency += (tf - t0 - latency) / n
-
             # sleep for a second to release the GIL no matter
             # what happened, then continue if no filenames
             # got returned
@@ -83,14 +73,22 @@ def main(
                 continue
 
             logging.info(
-                "Wrote cleaned data to {} with {:0.2f} ms of end-to-end "
-                "latency, average inf latency {:0.2f} ms".format(
-                    fname, e2e_latency * 1000, latency * 1000
+                "Wrote cleaned data to {} with {:0.2f} ms "
+                "of end-to-end latency".format(
+                    fname, e2e_latency * 1000,
                 )
             )
             n += 1
             if n == 100:
                 break
+
+    with open(fname, "a") as f:
+        while True:
+            try:
+                _, t0, __, tf = client._metric_q.get_nowait()
+            except queue.Empty:
+                break
+        f.write(f"\n{kernel_stride},{t0},{tf}")
 
 
 if __name__ == "__main__":
