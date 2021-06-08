@@ -14,6 +14,7 @@ import tritonclient.grpc as triton
 from google.protobuf import text_format
 from gwpy.timeseries import TimeSeries, TimeSeriesDict
 from stillwater import ExceptionWrapper, StreamingInferenceProcess, Package
+from tritonclient.utils import InferenceServerException
 from wurlitzer import sys_pipes
 
 
@@ -167,6 +168,7 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         output_dir,
         channel_name,
         sample_rate,
+        kernel_stride,
         name=None
     ):
         if not os.path.exists(output_dir):
@@ -175,6 +177,7 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         self.output_dir = output_dir
         self.channel_name = channel_name
         self.sample_rate = sample_rate
+        self.update_size = int(sample_rate * kernel_stride)
 
         self._strains = []
         self._noise = np.array([])
@@ -193,12 +196,15 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
             # check if we have a new strain
             # from the reader process first
             self._strains.append(stuff)
-        return self._try_recv_and_check(self._parents.client)
+        package = self._try_recv_and_check(self._parents.client)
+        return package
 
     def _do_stuff_with_data(self, package):
         # add the new inferences to the
         # running noise estimate array
-        self._noise = np.append(self._noise, package["output_0"].x[0, -8:])
+        self._noise = np.append(
+            self._noise, package["output_0"].x[0, -self.update_size:]
+        )
 
         if len(self._noise) >= self.sample_rate:
             # if we've accumulated a frame's worth of
@@ -258,8 +264,12 @@ class DummyClient(StreamingInferenceProcess):
 
 class ModelController:
     def __init__(self, url, model_repo):
-        self.client = triton.InferenceServerClient(url)
+        self.url = url
         self.model_repo = model_repo
+
+    @property
+    def client(self):
+        return triton.InferenceServerClient(self.url)
 
     @property
     def deepclean_config(self):
@@ -269,15 +279,13 @@ class ModelController:
         model_config = triton.model_config_pb2.ModelConfig()
         with open(self.deepclean_config, "r") as f:
             text_format.Merge(f.read(), model_config)
-            model_config.MergeFromString(f.read())
 
+        instance_group = triton.model_config_pb2.ModelInstanceGroup(
+            count=count, gpus=gpus
+        )
         try:
-            model_config.instance_group[0].gpus = gpus
-            model_config.instance_group[0].count = count
+            model_config.instance_group[0].MergeFrom(instance_group)
         except IndexError:
-            instance_group = triton.model_config_pb2.ModelInstanceGroup(
-                count=count, gpus=gpus
-            )
             model_config.instance_group.append(instance_group)
 
         with open(self.deepclean_config, "w") as f:
@@ -285,8 +293,25 @@ class ModelController:
 
     def load(self, kernel_stride):
         model_name = f"dc-stream_kernel-stride={kernel_stride}"
-        self.client.load_model(model_name)
+        for i in range(2):
+            try:
+                self.client.load_model(model_name)
+                break
+            except InferenceServerException as e:
+                exc = str(e)
+                time.sleep(5 * (1 - i))
+        else:
+            raise RuntimeError(exc)
+         
 
     def unload(self, kernel_stride):
         model_name = f"dc-stream_kernel-stride={kernel_stride}"
-        self.client.unload_model(model_name, unload_dependents=True)
+        for i in range(2):
+            try:
+                self.client.unload_model(model_name, unload_dependents=True)
+                break
+            except InferenceServerException as e:
+                exc = str(e)
+                time.sleep(5 * (1 - i))
+        else:
+            raise RuntimeError(exc)

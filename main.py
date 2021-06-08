@@ -18,7 +18,8 @@ def main(
     kernel_stride: float,
     sample_rate: int,  # TODO: can get from model config,
     output_dir: str,
-    fname: str
+    fname: str,
+    N: int = 100
 ):
     with open(channels, "r") as f:
         channels = f.read().splitlines()
@@ -31,6 +32,7 @@ def main(
         output_dir,
         channel_name=channels[0],
         sample_rate=sample_rate,
+        kernel_stride=kernel_stride,
         name="writer"
     )
 
@@ -79,15 +81,24 @@ def main(
                 )
             )
             n += 1
-            if n == 100:
+            if n == N:
                 break
 
     with open(fname, "a") as f:
         while True:
             try:
-                _, t0, __, tf = client._metric_q.get_nowait()
+                stuff = client._metric_q.get_nowait()
             except queue.Empty:
                 break
+
+            try:
+                _, t0, __, tf = stuff
+            except ValueError:
+                _, start_time = stuff
+                continue
+
+            t0 -= start_time
+            tf -= start_time
         f.write(f"\n{kernel_stride},{t0},{tf}")
 
 

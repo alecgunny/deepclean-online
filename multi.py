@@ -30,7 +30,7 @@ def main(
             for kernel_stride in kernel_strides:
                 model_name = f"dc-stream_kernel-stride={kernel_stride}"
                 logging.info(f"Loading model {model_name}")
-                controller.load(model_name)
+                controller.load(kernel_stride)
 
                 logging.info("Model loaded, running expt")
                 run_one_expt(
@@ -48,6 +48,7 @@ def main(
                 for f in glob.glob("*.gwf"):
                     os.remove(f)
                 logging.info(f"Unloading model {model_name}")
+                controller.unload(kernel_stride)
 
 
 if __name__ == "__main__":
