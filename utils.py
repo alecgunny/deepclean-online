@@ -31,16 +31,15 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         self,
         input_pattern: str,
         channels: typing.List[str],
-        kernel_stride: float,
+        update_size: int,
         sample_rate: float,
         preproc_file: str,
         name: typing.Optional[str] = None
     ):
         self.input_pattern = input_pattern
         self.channels = channels
-        self.kernel_stride = kernel_stride
         self.sample_rate = sample_rate
-        self._update_size = int(kernel_stride * sample_rate)
+        self.update_size = update_size
 
         self._idx = None
         self._data = None
@@ -111,7 +110,7 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         self._data = data
         self._t0 += 1
         self._idx = 0
-        return 0, self._update_size
+        return 0, self.update_size
 
     def _get_data(self):
         # if we've never loaded a frame, initialize
@@ -121,8 +120,8 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
             self._idx = 0
             self._t0 = self._get_initial_timestamp()
 
-        start = self._idx * self._update_size
-        stop = (self._idx + 1) * self._update_size
+        start = self._idx * self.update_size
+        stop = (self._idx + 1) * self.update_size
 
         # if we haven't loaded a frame or don't have enough
         # data left in the current frame to generate a state
@@ -136,7 +135,8 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         # offset the frame's initial time by the time
         # corresponding to the first sample of stream
         self._idx += 1
-        while (time.time() - self._last_time) < (self.kernel_stride / 2):
+        sleep_time = self.update_size / (2 * self.sample_rate)
+        while (time.time() - self._last_time) < (sleep_time):
             time.sleep(1e-6)
         self._last_time = time.time()
         return Package(x=x, t0=self._last_time)
@@ -168,7 +168,6 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         output_dir,
         channel_name,
         sample_rate,
-        kernel_stride,
         name=None
     ):
         if not os.path.exists(output_dir):
@@ -177,7 +176,6 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         self.output_dir = output_dir
         self.channel_name = channel_name
         self.sample_rate = sample_rate
-        self.update_size = int(sample_rate * kernel_stride)
 
         self._strains = []
         self._noise = np.array([])
@@ -202,9 +200,7 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
     def _do_stuff_with_data(self, package):
         # add the new inferences to the
         # running noise estimate array
-        self._noise = np.append(
-            self._noise, package["output_0"].x[0, -self.update_size:]
-        )
+        self._noise = np.append(self._noise, package["output_0"].x[0])
 
         if len(self._noise) >= self.sample_rate:
             # if we've accumulated a frame's worth of
@@ -271,13 +267,15 @@ class ModelController:
     def client(self):
         return triton.InferenceServerClient(self.url)
 
-    @property
-    def deepclean_config(self):
-        return os.path.join(self.model_repo, "deepclean", "config.pbtxt")
+    def deepclean_config(self, output_size):
+        postfix = f"output-size={output_size}"
+        return os.path.join(
+            self.model_repo, f"deepclean_{postfix}", "config.pbtxt"
+        )
 
-    def scale(self, gpus, count):
+    def scale(self, output_size, gpus, count):
         model_config = triton.model_config_pb2.ModelConfig()
-        with open(self.deepclean_config, "r") as f:
+        with open(self.deepclean_config(output_size), "r") as f:
             text_format.Merge(f.read(), model_config)
 
         instance_group = triton.model_config_pb2.ModelInstanceGroup(
@@ -288,11 +286,11 @@ class ModelController:
         except IndexError:
             model_config.instance_group.append(instance_group)
 
-        with open(self.deepclean_config, "w") as f:
+        with open(self.deepclean_config(output_size), "w") as f:
             f.write(str(model_config))
 
-    def load(self, kernel_stride):
-        model_name = f"dc-stream_kernel-stride={kernel_stride}"
+    def load(self, output_size):
+        model_name = f"dc-stream_output_size={output_size}"
         for i in range(2):
             try:
                 self.client.load_model(model_name)
@@ -304,8 +302,8 @@ class ModelController:
             raise RuntimeError(exc)
          
 
-    def unload(self, kernel_stride):
-        model_name = f"dc-stream_kernel-stride={kernel_stride}"
+    def unload(self, output_size):
+        model_name = f"dc-stream_kernel-stride={output_size}"
         for i in range(2):
             try:
                 self.client.unload_model(model_name, unload_dependents=True)

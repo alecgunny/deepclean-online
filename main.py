@@ -15,10 +15,10 @@ def main(
     model_version: int,
     input_pattern: str,
     channels: str,
-    kernel_stride: float,
+    output_size: int,
     sample_rate: int,  # TODO: can get from model config,
     output_dir: str,
-    fname: str,
+    stats_file: str,
     N: int = 100
 ):
     with open(channels, "r") as f:
@@ -32,14 +32,13 @@ def main(
         output_dir,
         channel_name=channels[0],
         sample_rate=sample_rate,
-        kernel_stride=kernel_stride,
         name="writer"
     )
 
     source = GwfFrameFileDataSource(
         input_pattern,
         channels=channels,
-        kernel_stride=kernel_stride,
+        update_size=output_size,
         sample_rate=sample_rate,
         preproc_file="",
         name="reader"
@@ -56,9 +55,9 @@ def main(
             if conn_out.poll():
                 fname = conn_out.recv()
                 last_recv_time = time.time()
-            elif (time.time() - last_recv_time) > 3:
+            elif (time.time() - last_recv_time) > 20:
                 raise RuntimeError(
-                    "No files written in last 3 seconds, exiting"
+                    "No files written in last 20 seconds, exiting"
                 )
 
             # make sure our pipeline didn't raise an error
@@ -84,7 +83,7 @@ def main(
             if n == N:
                 break
 
-    with open(fname, "a") as f:
+    with open(stats_file, "a") as f:
         while True:
             try:
                 stuff = client._metric_q.get_nowait()
@@ -93,13 +92,13 @@ def main(
 
             try:
                 _, t0, __, tf = stuff
+                t0 -= start_time
+                tf -= start_time
             except ValueError:
                 _, start_time = stuff
                 continue
-
-            t0 -= start_time
-            tf -= start_time
-        f.write(f"\n{kernel_stride},{t0},{tf}")
+            f.write(f"\n{output_size},{t0},{tf}")
+    
 
 
 if __name__ == "__main__":
