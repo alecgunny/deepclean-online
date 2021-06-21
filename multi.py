@@ -32,7 +32,7 @@ def main(
                 logging.info(f"Loading model {model_name}")
                 controller.load(model_name)
 
-                logging.info("Model loaded, running expt")
+                logging.info(f"Model {model_name} loaded, running expt")
                 run_one_expt(
                     url,
                     model_name,
