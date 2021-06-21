@@ -65,9 +65,13 @@ def main(
     client.add_data_source(source, child=writer)
     conn_out = writer.add_child("output")
 
+    monitor = utils.ServerMonitor(
+        ips=["0.0.0.0"], filename=stats_file.replace("client", "server")
+    )
+
     last_recv_time = time.time()
     n = 0
-    with source, client, writer:
+    with source, client, writer, monitor:
         while True:
             fname = None
             if conn_out.poll():
@@ -101,6 +105,7 @@ def main(
             if n == N:
                 break
 
+    monitor.check()
     _, start_time = client._metric_q.get_nowait()
     with open(stats_file, "a") as f:
         while True:
