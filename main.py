@@ -6,7 +6,11 @@ import time
 import typeo
 from stillwater import StreamingInferenceClient
 from stillwater.utils import ExceptionWrapper
-from utils import GwfFrameFileDataSource, GwfFrameFileWriter
+from utils import (
+    GwfFrameFileDataSource,
+    GwfFrameFileWriter,
+    StreamingGwfFrameFileDataSource
+)
 
 
 def main(
@@ -15,10 +19,12 @@ def main(
     model_version: int,
     input_pattern: str,
     channels: str,
-    kernel_stride: float,
+    output_size: int,
     sample_rate: int,  # TODO: can get from model config,
     output_dir: str,
-    fname: str
+    stats_file: str,
+    N: int = 100,
+    stream: bool = True
 ):
     with open(channels, "r") as f:
         channels = f.read().splitlines()
@@ -27,25 +33,38 @@ def main(
     client = StreamingInferenceClient(
         url, model_name, model_version, name="client"
     )
+
+    if stream:
+        source = StreamingGwfFrameFileDataSource(
+            input_pattern,
+            channels=channels,
+            update_size=output_size,
+            sample_rate=sample_rate,
+            preproc_file="",
+            name="reader"
+        )
+    else:
+        source = GwfFrameFileDataSource(
+            input_pattern,
+            channels=channels,
+            kernel_size=sample_rate,
+            kernel_stride=output_size,
+            sample_rate=sample_rate,
+            preproc_file="",
+            name="reader"
+        )
+
     writer = GwfFrameFileWriter(
         output_dir,
         channel_name=channels[0],
         sample_rate=sample_rate,
+        q=source._writer_q,
         name="writer"
     )
 
-    source = GwfFrameFileDataSource(
-        input_pattern,
-        channels=channels,
-        kernel_stride=kernel_stride,
-        sample_rate=sample_rate,
-        preproc_file="",
-        name="reader"
-    )
-    writer.add_parent(source)
     client.add_data_source(source, child=writer)
-
     conn_out = writer.add_child("output")
+
     last_recv_time = time.time()
     n = 0
     with source, client, writer:
@@ -54,9 +73,9 @@ def main(
             if conn_out.poll():
                 fname = conn_out.recv()
                 last_recv_time = time.time()
-            elif (time.time() - last_recv_time) > 3:
+            elif (time.time() - last_recv_time) > 20:
                 raise RuntimeError(
-                    "No files written in last 3 seconds, exiting"
+                    "No files written in last 20 seconds, exiting"
                 )
 
             # make sure our pipeline didn't raise an error
@@ -79,16 +98,21 @@ def main(
                 )
             )
             n += 1
-            if n == 100:
+            if n == N:
                 break
 
-    with open(fname, "a") as f:
+    _, start_time = client._metric_q.get_nowait()
+    with open(stats_file, "a") as f:
         while True:
             try:
-                _, t0, __, tf = client._metric_q.get_nowait()
+                stuff = client._metric_q.get_nowait()
             except queue.Empty:
                 break
-        f.write(f"\n{kernel_stride},{t0},{tf}")
+
+            _, t0, __, tf = stuff
+            t0 -= start_time
+            tf -= start_time
+            f.write(f"\n{output_size},{t0},{tf}")
 
 
 if __name__ == "__main__":
