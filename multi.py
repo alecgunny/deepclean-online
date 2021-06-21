@@ -51,7 +51,8 @@ def main(
                             sample_rate=4000,
                             output_dir=".",
                             stats_file=fname,
-                            N=20
+                            N=20,
+                            stream=True
                         )
                         break
                     except Exception as e:

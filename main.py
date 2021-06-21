@@ -24,7 +24,7 @@ def main(
     output_dir: str,
     stats_file: str,
     N: int = 100,
-    stream: bool = True
+    stream: bool = False
 ):
     with open(channels, "r") as f:
         channels = f.read().splitlines()
