@@ -116,7 +116,7 @@ class StreamingGwfFrameFileDataSource(StreamingInferenceProcess):
         # in the indicated directory to begin
         if self._idx is None:
             self._idx = 0
-            self._t0 = self._get_initial_timestamp(self.input_pattern)
+            self._t0 = _get_initial_timestamp(self.input_pattern)
 
         start = self._idx * self.update_size
         stop = (self._idx + 1) * self.update_size
@@ -265,18 +265,14 @@ class GwfFrameFileDataSource(StreamingInferenceProcess):
         # offset the frame's initial time by the time
         # corresponding to the first sample of stream
         self._idx += 1
-        sleep_time = self.update_size / (2 * self.sample_rate)
+        sleep_time = self.kernel_stride / (2 * self.sample_rate)
         while (time.time() - self._last_time) < (sleep_time):
             time.sleep(1e-6)
         self._last_time = time.time()
-        return Package(x=x, t0=self._last_time)
+        return Package(x=x[None], t0=self._last_time)
 
     def _break_glass(self, exception):
-        super()._break_glass(exception)
         self._self_q.put(ExceptionWrapper(exception))
-
-    def _do_stuff_with_data(self, package):
-        self._self_q.put(package)
 
     def __iter__(self):
         return self
@@ -398,7 +394,7 @@ class ModelController:
         return triton.InferenceServerClient(self.url)
 
     def deepclean_config(self, output_size):
-        postfix = f"output-size={output_size}"
+        postfix = f"output_size={output_size}"
         return os.path.join(
             self.model_repo, f"deepclean_{postfix}", "config.pbtxt"
         )
@@ -432,7 +428,7 @@ class ModelController:
             raise RuntimeError(exc)
 
     def unload(self, output_size):
-        model_name = f"dc-stream_kernel-stride={output_size}"
+        model_name = f"dc-stream_output_size={output_size}"
         for i in range(2):
             try:
                 self.client.unload_model(model_name, unload_dependents=True)
