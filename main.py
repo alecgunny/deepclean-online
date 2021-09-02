@@ -1,5 +1,4 @@
 import logging
-import queue
 import sys
 import time
 
@@ -9,7 +8,6 @@ from stillwater.utils import ExceptionWrapper
 from utils import (
     GwfFrameFileDataSource,
     GwfFrameFileWriter,
-    ServerMonitor,
     StreamingGwfFrameFileDataSource
 )
 
@@ -20,16 +18,15 @@ def main(
     model_version: int,
     input_pattern: str,
     channels: str,
-    output_size: int,
-    sample_rate: int,  # TODO: can get from model config,
+    preproc_file: str,
+    sample_rate: float,  # TODO: can get from model config,
+    inference_sampling_rate: float,
     output_dir: str,
-    stats_file: str,
-    N: int = 100,
+    kernel_length: int = 1,
     stream: bool = False
 ):
     with open(channels, "r") as f:
-        channels = f.read().splitlines()
-        channels = [x.split()[0] for x in channels[:22]]
+        channels = [i for i in f.read().splitlines() if i]
 
     client = StreamingInferenceClient(
         url, model_name, model_version, name="client"
@@ -39,19 +36,19 @@ def main(
         source = StreamingGwfFrameFileDataSource(
             input_pattern,
             channels=channels,
-            update_size=output_size,
             sample_rate=sample_rate,
-            preproc_file="",
+            inference_sampling_rate=inference_sampling_rate,
+            preproc_file=preproc_file,
             name="reader"
         )
     else:
         source = GwfFrameFileDataSource(
             input_pattern,
             channels=channels,
-            kernel_size=sample_rate,
-            kernel_stride=output_size,
+            kernel_size=int(sample_rate * kernel_length),
             sample_rate=sample_rate,
-            preproc_file="",
+            inference_sampling_rate=inference_sampling_rate,
+            preproc_file=preproc_file,
             name="reader"
         )
 
@@ -66,15 +63,8 @@ def main(
     client.add_data_source(source, child=writer)
     conn_out = writer.add_child("output")
 
-    monitor = ServerMonitor(
-        filename=stats_file.replace("client", f"server-{output_size}"),
-        model_name=model_name,
-        rate=20
-    )
-
     last_recv_time = time.time()
-    n = 0
-    with source, client, writer, monitor:
+    with source, client, writer:
         while True:
             fname = None
             if conn_out.poll():
@@ -94,7 +84,7 @@ def main(
             # sleep for a second to release the GIL no matter
             # what happened, then continue if no filenames
             # got returned
-            time.sleep(0.1)
+            time.sleep(0.01)
             if fname is None:
                 continue
 
@@ -104,22 +94,6 @@ def main(
                     fname, e2e_latency * 1000,
                 )
             )
-            n += 1
-            if n == N:
-                break
-
-    _, start_time = client._metric_q.get_nowait()
-    with open(stats_file, "a") as f:
-        while True:
-            try:
-                stuff = client._metric_q.get_nowait()
-            except queue.Empty:
-                break
-
-            _, t0, __, tf = stuff
-            t0 -= start_time
-            tf -= start_time
-            f.write(f"\n{output_size},{t0},{tf}")
 
 
 if __name__ == "__main__":

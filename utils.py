@@ -1,24 +1,18 @@
-import concurrent.futures
 import glob
 import logging
 import os
+import pickle
 import queue
 import re
-import threading
 import time
 import typing
 import multiprocessing as mp
-from contextlib import redirect_stderr
-from io import StringIO
+from functools import partial
 
 import numpy as np
-import requests
-import tritonclient.grpc as triton
-from google.protobuf import text_format
+import scipy.signal as sig
 from gwpy.timeseries import TimeSeries, TimeSeriesDict
 from stillwater import ExceptionWrapper, StreamingInferenceProcess, Package
-from tritonclient.utils import InferenceServerException
-from wurlitzer import sys_pipes
 
 
 def _get_file_timestamp(fname):
@@ -29,13 +23,21 @@ def _get_file_timestamp(fname):
     return file_creation_timestamp
 
 
+def _load_preproc(fname: str) -> typing.Tuple[float, float]:
+    with open(fname, "wb") as f:
+        preproc = pickle.load(f)
+        mean = preproc["mean"]
+        std = preproc["std"]
+    return mean, std
+
+
 class AsyncGwfReader(StreamingInferenceProcess):
     def __init__(
         self,
         input_pattern: str,
         channels: typing.List[str],
-        update_size: int,
         sample_rate: float,
+        inference_sampling_rate: float,
         preproc_file: str,
         N: typing.Optional[int] = None,
         name: typing.Optional[str] = None
@@ -43,7 +45,7 @@ class AsyncGwfReader(StreamingInferenceProcess):
         self.input_pattern = input_pattern
         self.channels = channels
         self.sample_rate = sample_rate
-        self.update_size = update_size
+        self.update_size = sample_rate // inference_sampling_rate
 
         self._idx = 0
         self._data = None
@@ -55,6 +57,7 @@ class AsyncGwfReader(StreamingInferenceProcess):
         self._self_q = mp.Queue()
         self._writer_q = mp.Queue()
 
+        self.mean, self.std = _load_preproc(preproc_file)
         super().__init__(name=name)
 
     def _get_initial_timestamp(self):
@@ -94,7 +97,9 @@ class AsyncGwfReader(StreamingInferenceProcess):
                 logging.info(f"Loaded {self._n}th frame {frame_path}")
                 break
             except FileNotFoundError:
-                logging.info(f"No file found for timestamp {self._t0}, waiting...")
+                logging.info(
+                    f"No file found for timestamp {self._t0}, waiting..."
+                )
                 time.sleep(1e-3)
         else:
             raise ValueError(f"Couldn't find next timestep file {frame_path}")
@@ -104,6 +109,7 @@ class AsyncGwfReader(StreamingInferenceProcess):
         data = np.stack(
             [data[channel].value for channel in self.channels]
         ).astype("float32")
+        data = (data - self.mean) / self.std
 
         # send strain and filename to writer process
         # for subtraction/writing later.
@@ -174,7 +180,7 @@ class StreamingGwfFrameFileDataSource(AsyncGwfReader):
             except queue.Empty:
                 time.sleep(1e-4)
         else:
-          raise RuntimeError("No data!")
+            raise RuntimeError("No data!")
 
 
 class GwfFrameFileDataSource(AsyncGwfReader):
@@ -183,8 +189,8 @@ class GwfFrameFileDataSource(AsyncGwfReader):
         input_pattern: str,
         channels: typing.List[str],
         kernel_size: float,
-        kernel_stride: float,
         sample_rate: float,
+        inference_sampling_rate: float,
         preproc_file: str,
         name: typing.Optional[str] = None
     ):
@@ -192,8 +198,8 @@ class GwfFrameFileDataSource(AsyncGwfReader):
         super().__init__(
             input_pattern=input_pattern,
             channels=channels,
-            update_size=kernel_stride,
             sample_rate=sample_rate,
+            inference_sampling_rate=inference_sampling_rate,
             preproc_file=preproc_file,
             name=name
         )
@@ -261,10 +267,11 @@ class GwfFrameFileDataSource(AsyncGwfReader):
 class GwfFrameFileWriter(StreamingInferenceProcess):
     def __init__(
         self,
-        output_dir,
-        channel_name,
-        sample_rate,
-        q,
+        output_dir: str,
+        channel_name: str,
+        sample_rate: float,
+        q: queue.Queue,
+        preproc_file: str,
         name=None
     ):
         if not os.path.exists(output_dir):
@@ -279,7 +286,48 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         self._noise = np.array([])
         self._first_strain = True
         self._first_noise = True
+
+        self.mean, self.std = _load_preproc(preproc_file)
+
+        # TODO: generalize
+        with open(preproc_file, "wb") as f:
+            preproc = pickle.load(f)
+            filt_kwargs = {}
+            filt_kwargs = {
+                i: preproc[f"filt_{i}"] for i in ["fl", "fh", "order"]
+            }
+            self.filter = partial(self.bandpass, **filt_kwargs)
         super().__init__(name=name)
+
+    @staticmethod
+    def bandpass(data, fs, fl, fh, order=None, axis=-1):
+        """Copied from deepclean_prod for now
+
+        Parameters
+        ----------
+        data: array
+        fs: sampling frequency
+        fl, fh: low and high frequency for bandpass
+        axis: axis to apply the filter on
+
+        Returns:
+        --------
+        data_filt: filtered array
+        """
+        if order is None:
+            order = 8
+
+        # Make filter
+        nyq = fs / 2.
+        low, high = fl / nyq, fh / nyq   # normalize frequency
+        z, p, k = sig.butter(
+            order, [low, high], btype='bandpass', output='zpk'
+        )
+        sos = sig.zpk2sos(z, p, k)
+
+        # Apply filter and return output
+        data_filt = sig.sosfiltfilt(sos, data, axis=axis)
+        return data_filt
 
     def _try_recv_and_check(self, conn):
         if conn.poll():
@@ -308,6 +356,7 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
         # running noise estimate array
         self._noise = np.append(self._noise, package["output_0"].x[0])
 
+        # TODO: this is 1-second specific, make more general
         if len(self._noise) >= self.sample_rate:
             # if we've accumulated a frame's worth of
             # noise, split it off and subtract it from
@@ -327,6 +376,8 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
 
             # subtract the noise estimate from the strain
             # and create a gwpy timeseries from it
+            noise = noise * self.std + self.mean
+            noise = self.filter(noise)
             cleaned = strain - noise
             timeseries = TimeSeries(
                 cleaned,
@@ -337,165 +388,10 @@ class GwfFrameFileWriter(StreamingInferenceProcess):
 
             # add "_cleaned" to the filename and write the cleaned
             # strain to this new file in the desired location
-            write_fname = fname.replace(".gwf", "_cleaned.gwf")
-            write_fname = os.path.join(self.output_dir, write_fname)
+            write_fname = os.path.join(self.output_dir, fname)
             timeseries.write(write_fname)
 
             # let the main process know that we wrote a file and
             # what the corresponding latency to that write was
             latency = time.time() - _get_file_timestamp(frame_path)
             self._children.output.send((write_fname, latency))
-
-
-class DummyClient(StreamingInferenceProcess):
-    def __init__(self, reader, name=None):
-        self.reader = iter(reader)
-        super().__init__(name=name)
-
-    def _get_data(self):
-        return next(self.reader)
-
-    def _do_stuff_with_data(self, package):
-        package.x = package.x.sum(axis=0) * 0.
-        self._children.writer.send(package)
-
-    def __exit__(self, *exc_args):
-        super().__exit__(*exc_args)
-        self.reader.try_elegant_stop()
-
-
-class ModelController:
-    def __init__(self, url, model_repo):
-        self.url = url
-        self.model_repo = model_repo
-
-    @property
-    def client(self):
-        return triton.InferenceServerClient(self.url)
-
-    def deepclean_config(self, output_size):
-        postfix = f"output_size={output_size}"
-        return os.path.join(
-            self.model_repo, f"deepclean_{postfix}", "config.pbtxt"
-        )
-
-    def scale(self, output_size, gpus, count):
-        model_config = triton.model_config_pb2.ModelConfig()
-        with open(self.deepclean_config(output_size), "r") as f:
-            text_format.Merge(f.read(), model_config)
-
-        instance_group = triton.model_config_pb2.ModelInstanceGroup(
-            count=count, gpus=gpus
-        )
-        try:
-            model_config.instance_group.pop(0)
-        except IndexError:
-            pass
-        model_config.instance_group.append(instance_group)
-
-        with open(self.deepclean_config(output_size), "w") as f:
-            f.write(str(model_config))
-
-    def load(self, output_size):
-        model_name = f"dc-stream_output_size={output_size}"
-        for i in range(2):
-            try:
-                self.client.load_model(model_name)
-                break
-            except InferenceServerException as e:
-                exc = str(e)
-                time.sleep(5 * (1 - i))
-        else:
-            raise RuntimeError(exc)
-
-    def unload(self, output_size):
-        model_name = f"dc-stream_output_size={output_size}"
-        config = self.client.get_model_config(model_name).config
-        model_names = [i.model_name for i in config.ensemble_scheduling.step]
-        model_names.insert(0, model_name)
-
-        for model_name in model_names:
-            for i in range(2):
-                try:
-                    self.client.unload_model(model_name)
-                    break
-                except InferenceServerException as e:
-                    exc = str(e)
-                    time.sleep(5 * (1 - i))
-            else:
-                raise RuntimeError(exc)
-
-
-class ServerMonitor(mp.Process):
-    def __init__(self, filename, rate, output_size):
-        self.filename = filename
-        self.rate = rate
-
-        self._last_time = None
-        self._last_values = {}
-        self._last_durs = {}
-        self._event = mp.Event()
-        self.output_size = output_size
-        super().__init__()
- 
-    def run(self):
-        with open(self.filename, "w") as f:
-            f.write("interval,dc-stream_count,dc-stream_us")
-            f.write(",snapshotter_count,snapshotter_queue")
-            f.write(",deepclean_count,deepclean_queue")
-
-            while not self._event.is_set():
-                if (self._last_time is not None and
-                    (time.time() - self._last_time) <  1 / self.rate
-                ):
-                    time.sleep(1e-3)
-                    continue
-
-                content = requests.get(
-                    "http://0.0.0.0:8002/metrics"
-                ).content.decode()
-                get_time = time.time()
-
-                values = []
-                for model in ["dc-stream", "snapshotter", "deepclean"]:
-                    process = "request" if model == "dc-stream" else "queue"
-                    model = f"{model}_output_size={self.output_size}"
-                    metrics = ["exec_count", f"{process}_duration_us"]
-                    for metric in metrics:
-                        for row in content.splitlines():
-                            if row.startswith(f"nv_inference_{metric}") and model in row:
-                                value = int(float(row.split()[-1]))
-                            else:
-                                continue
-                            try:
-                                last_value = self._last_values[(model, metric)]
-                            except KeyError:
-                                continue
-                            finally:
-                                self._last_values[(model, metric)] = value
-
-                            value -= last_value
-                            if value > 0:
-                                values.append(value)
-                            break
-
-                if self._last_time is None:
-                    self._last_time = get_time
-                    continue
-                else:
-                    interval = get_time - self._last_time
-                    self._last_time = get_time
-
-                values.insert(0, interval)
-                if len(values) < 7:
-                    continue
-                f.write("\n" + ",".join(map(str, values)))
-
-    def __enter__(self):
-        self.start()
-
-    def __exit__(self, *exc_args):
-        self._event.set()
-        self.join(10)
-        self.close()
-
