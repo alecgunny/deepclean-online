@@ -1,5 +1,6 @@
 import concurrent.futures
 import glob
+import logging
 import os
 import queue
 import re
@@ -36,7 +37,8 @@ class AsyncGwfReader(StreamingInferenceProcess):
         update_size: int,
         sample_rate: float,
         preproc_file: str,
-        name: typing.Osptional[str] = None
+        N: typing.Optional[int] = None,
+        name: typing.Optional[str] = None
     ):
         self.input_pattern = input_pattern
         self.channels = channels
@@ -46,6 +48,8 @@ class AsyncGwfReader(StreamingInferenceProcess):
         self._idx = 0
         self._data = None
         self._t0 = None
+        self._n = 0
+        self._N = N
         self._last_time = time.time()
 
         self._self_q = mp.Queue()
@@ -78,15 +82,19 @@ class AsyncGwfReader(StreamingInferenceProcess):
         # timeout after 3 seconds if nothing becomes available
         if self._t0 is None:
             self._t0 = self._get_initial_timestamp()
+        if self._N is not None and self._n == self._N:
+            raise StopIteration
 
         start_time = time.time()
         frame_path = self.input_pattern.format(self._t0)
-        while time.time() - start_time < 3:
+        while (time.time() - start_time) < 0.5:
             try:
-                with redirect_stderr(StringIO()), sys_pipes():
-                    data = TimeSeriesDict.read(frame_path, self.channels)
+                # with redirect_stderr(StringIO()), sys_pipes():
+                data = TimeSeriesDict.read(frame_path, self.channels)
+                logging.info(f"Loaded {self._n}th frame {frame_path}")
                 break
             except FileNotFoundError:
+                logging.info(f"No file found for timestamp {self._t0}, waiting...")
                 time.sleep(1e-3)
         else:
             raise ValueError(f"Couldn't find next timestep file {frame_path}")
@@ -105,6 +113,7 @@ class AsyncGwfReader(StreamingInferenceProcess):
         strain, data = data[0], data[1:]
         self._writer_q.put((frame_path, strain))
         self._t0 += 1
+        self._n += 1
 
         return data
 
@@ -128,7 +137,6 @@ class StreamingGwfFrameFileDataSource(AsyncGwfReader):
 
             # reset everything
             self._data = data
-            self._t0 += 1
             self._idx = 0
             start, stop = 0, self.update_size
 
@@ -155,14 +163,18 @@ class StreamingGwfFrameFileDataSource(AsyncGwfReader):
         return self
 
     def __next__(self):
-        while True:
+        timeout = 3
+        start_time = time.time()
+        while (time.time() - start_time) < timeout:
             try:
                 package = self._self_q.get_nowait()
                 if isinstance(package, ExceptionWrapper):
                     package.reraise()
                 return package
             except queue.Empty:
-                time.sleep(1e-6)
+                time.sleep(1e-4)
+        else:
+          raise RuntimeError("No data!")
 
 
 class GwfFrameFileDataSource(AsyncGwfReader):
@@ -376,9 +388,10 @@ class ModelController:
             count=count, gpus=gpus
         )
         try:
-            model_config.instance_group[0].MergeFrom(instance_group)
+            model_config.instance_group.pop(0)
         except IndexError:
-            model_config.instance_group.append(instance_group)
+            pass
+        model_config.instance_group.append(instance_group)
 
         with open(self.deepclean_config(output_size), "w") as f:
             f.write(str(model_config))
@@ -397,192 +410,92 @@ class ModelController:
 
     def unload(self, output_size):
         model_name = f"dc-stream_output_size={output_size}"
-        for i in range(2):
-            try:
-                self.client.unload_model(model_name, unload_dependents=True)
-                break
-            except InferenceServerException as e:
-                exc = str(e)
-                time.sleep(5 * (1 - i))
-        else:
-            raise RuntimeError(exc)
+        config = self.client.get_model_config(model_name).config
+        model_names = [i.model_name for i in config.ensemble_scheduling.step]
+        model_names.insert(0, model_name)
 
-
-_hexes = "[0-9a-f]"
-_gpu_id_pattern = "-".join([_hexes + f"{{{i}}}" for i in [8, 4, 4, 4, 12]])
-_res = [
-    re.compile('(?<=nv_inference_)[a-z_]+(?=_duration_us{gpu_uuid="GPU-)'),
-    re.compile(f'(?<=gpu_uuid="GPU-){_gpu_id_pattern}(?=")'),
-    re.compile(f'(?<=model=")[a-z_]+(?=",version=)'),
-    re.compile("(?<=} )[0-9.]+$")
-]
+        for model_name in model_names:
+            for i in range(2):
+                try:
+                    self.client.unload_model(model_name)
+                    break
+                except InferenceServerException as e:
+                    exc = str(e)
+                    time.sleep(5 * (1 - i))
+            else:
+                raise RuntimeError(exc)
 
 
 class ServerMonitor(mp.Process):
-    def __init__(self, ips, filename):
-        self.ips = ips
+    def __init__(self, filename, rate, output_size):
         self.filename = filename
+        self.rate = rate
 
-        self.header = (
-            "ip,step,gpu_id,model,process,time (us),interval,count,utilization"
-        )
-        self._last_times = {}
-        self._counts = {}
-        self._times = {}
-
-        self._stop_event = mp.Event()
-        self._error_q = mp.Queue()
+        self._last_time = None
+        self._last_values = {}
+        self._last_durs = {}
+        self._event = mp.Event()
+        self.output_size = output_size
         super().__init__()
-
-    def _get_data_for_ip(self, ip, step):
-        response = requests.get(f"http://{ip}:8002/metrics")
-        response.raise_for_status()
-
-        request_time = time.time()
-        try:
-            last_time = self._last_times[ip]
-            interval = request_time - last_time
-        except KeyError:
-            pass
-        finally:
-            self._last_times[ip] = request_time
-
-        data, counts, utilizations = "", {}, {}
-        models_to_update = []
-        rows = response.content.decode().split("\n")
-
-        # start by collecting the number of new inference
-        # counts and the GPU utilization
-        for row in rows:
-            if row.startswith("nv_inference_exec_count"):
-                try:
-                    gpu_id, model, value = [
-                        r.search(row).group(0) for r in _res[1:]
-                    ]
-                except AttributeError:
-                    continue
-
-                if model in _MODELS:
-                    value = int(float(value))
-                    try:
-                        count = value - self._counts[(ip, gpu_id, model)]
-                        if count > 0:
-                            # if no new inferences were registered, we
-                            # won't need to update this model below
-                            models_to_update.append((gpu_id, model))
-                        counts[(ip, gpu_id, model)] = count
-                    except KeyError:
-                        # we haven't recorded this model before, so
-                        # there's no need to update it
-                        pass
-                    finally:
-                        # add or update the number of inference counts
-                        # for this model on this GPU
-                        self._counts[(ip, gpu_id, model)] = value
-
-            elif row.startswith("nv_gpu_utilization"):
-                try:
-                    gpu_id, value = [r.search(row).group(0) for r in _res[1::2]]
-                except AttributeError:
-                    continue
-                utilizations[gpu_id] = value
-
-        for row in rows:
-            try:
-                process, gpu_id, model, value = [
-                    r.search(row).group(0) for r in _res
-                ]
-            except AttributeError:
-                continue
-
-            value = float(value)
-            index = (ip, process, gpu_id, model)
-
-            if (gpu_id, model) not in models_to_update:
-                # we don't need to record a row of data for this
-                # GPU/model combination, either because this is
-                # the first loop or because we didn't record any
-                # new inferences during this interval
-                if model in _MODELS and index not in self._times:
-                    # we don't have a duration for this process
-                    # on this node/GPU/model combo, so create one
-                    self._times[index] = value
-                continue
-
-            delta = value - self._times[index]
-            self._times[index] = value
-            utilization = utilizations[gpu_id]
-            count = counts[(ip, gpu_id, model)]
-
-            data += "\n" + ",".join([
-                ip,
-                str(step),
-                gpu_id,
-                model,
-                process,
-                str(delta),
-                str(interval),
-                str(count),
-                utilization
-            ])
-        return data
-
-    @property
-    def stopped(self) -> bool:
-        return self._stop_event.is_set()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-
-    def check(self):
-        try:
-            e = self._error_q.get_nowait()
-        except queue.Empty:
-            return
-        raise RuntimeError("Error in monitor: " + e)
-
+ 
     def run(self):
-        f = open(self.filename, "w")
-        f.write(self.header)
+        with open(self.filename, "w") as f:
+            f.write("interval,dc-stream_count,dc-stream_us")
+            f.write(",snapshotter_count,snapshotter_queue")
+            f.write(",deepclean_count,deepclean_queue")
 
-        lock = threading.Lock()
+            while not self._event.is_set():
+                if (self._last_time is not None and
+                    (time.time() - self._last_time) <  1 / self.rate
+                ):
+                    time.sleep(1e-3)
+                    continue
 
-        def target(ip):
-            step = 0
-            try:
-                while not self.stopped:
-                    data = self._get_data_for_ip(ip, step)
-                    if data:
-                        with lock:
-                            f.write(data)
-                        step += 1
-            except Exception:
-                self.stop()
-                raise
+                content = requests.get(
+                    "http://0.0.0.0:8002/metrics"
+                ).content.decode()
+                get_time = time.time()
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(target, ip) for ip in self.ips]
+                values = []
+                for model in ["dc-stream", "snapshotter", "deepclean"]:
+                    process = "request" if model == "dc-stream" else "queue"
+                    model = f"{model}_output_size={self.output_size}"
+                    metrics = ["exec_count", f"{process}_duration_us"]
+                    for metric in metrics:
+                        for row in content.splitlines():
+                            if row.startswith(f"nv_inference_{metric}") and model in row:
+                                value = int(float(row.split()[-1]))
+                            else:
+                                continue
+                            try:
+                                last_value = self._last_values[(model, metric)]
+                            except KeyError:
+                                continue
+                            finally:
+                                self._last_values[(model, metric)] = value
 
-        try:
-            while len(futures) > 0:
-                done, futures = concurrent.futures.wait(futures, timeout=1e-2)
-                for future in done:
-                    exc = future.exception()
-                    if exc is not None:
-                        raise exc
-        except Exception as e:
-            self._error_q.put(str(e))
-        finally:
-            f.close()
+                            value -= last_value
+                            if value > 0:
+                                values.append(value)
+                            break
+
+                if self._last_time is None:
+                    self._last_time = get_time
+                    continue
+                else:
+                    interval = get_time - self._last_time
+                    self._last_time = get_time
+
+                values.insert(0, interval)
+                if len(values) < 7:
+                    continue
+                f.write("\n" + ",".join(map(str, values)))
 
     def __enter__(self):
         self.start()
-        return self
 
     def __exit__(self, *exc_args):
-        self.stop()
-        self.join(1)
-        try:
-            self.close()
-        except ValueError:
-            self.terminate()
+        self._event.set()
+        self.join(10)
+        self.close()
+

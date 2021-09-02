@@ -9,6 +9,7 @@ from stillwater.utils import ExceptionWrapper
 from utils import (
     GwfFrameFileDataSource,
     GwfFrameFileWriter,
+    ServerMonitor,
     StreamingGwfFrameFileDataSource
 )
 
@@ -65,8 +66,10 @@ def main(
     client.add_data_source(source, child=writer)
     conn_out = writer.add_child("output")
 
-    monitor = utils.ServerMonitor(
-        ips=["0.0.0.0"], filename=stats_file.replace("client", "server")
+    monitor = ServerMonitor(
+        filename=stats_file.replace("client", f"server-{output_size}"),
+        model_name=model_name,
+        rate=20
     )
 
     last_recv_time = time.time()
@@ -105,7 +108,6 @@ def main(
             if n == N:
                 break
 
-    monitor.check()
     _, start_time = client._metric_q.get_nowait()
     with open(stats_file, "a") as f:
         while True:
